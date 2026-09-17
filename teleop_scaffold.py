@@ -12,8 +12,14 @@ You complete it in three stages, each a part of the lab manual:
     python teleop_scaffold.py --check     # tests every TODO except 3 - no robot needed
     python teleop_scaffold.py             # run it
 
+This year's joystick is DIGITAL, not analog: dragging the knob snaps it to
+one of 8 compass directions (N, NE, E, SE, S, SW, W, NW) and every direction
+drives at a fixed speed - how far past the centre deadzone you push the
+stick does not change the speed, only which direction is selected.
+
 Controls:
-    drag the joystick        forward / backward (linear.x) and strafe (linear.y)
+    drag the joystick        snaps to 8 directions: forward/back (linear.x)
+                              and strafe (linear.y), together for a diagonal
     hold Rotate L / R        turn in place (angular.z)
     STOP button / space      stop
     hold the camera pad or arrow keys   pan / tilt the camera;  c or the centre button re-centres
@@ -22,6 +28,7 @@ Controls:
 Requires:  pip install websocket-client
 """
 import json
+import math
 import sys
 import threading
 import time
@@ -39,11 +46,14 @@ ROSBRIDGE_PORT = 9090
 # Driving (Part H)
 CMD_VEL_TOPIC  = "/cmd_vel"
 CMD_VEL_TYPE   = "geometry_msgs/msg/Twist"
-MAX_LINEAR  = 0.25          # m/s at full joystick deflection. Keep it low until it works.
+MAX_LINEAR  = 0.25          # m/s: the speed for a cardinal direction (N/E/S/W), and for the
+                            # major wheel pair on a diagonal. Keep it low until it works.
 MIN_LINEAR  = 0.15          # m/s: below this the motors do not turn at all (measured on the
-                            # robot), so any smaller non-zero command is raised to this value
+                            # robot). Also the speed used for the minor wheel pair on a
+                            # diagonal move - see "TODO 2" in the manual.
 MAX_ANGULAR = 1.5           # rad/s while a rotate button is held (below ~1.4 some wheels stall)
 PUBLISH_PERIOD_MS = 100     # send /cmd_vel 10 times a second, whether or not input changed
+JOY_DEADZONE = 0.3          # stick displacement below this counts as centered (stopped)
 
 # Camera pan/tilt servos (Part I)
 SERVO_TOPIC = "/ros_robot_controller/pwm_servo/set_state"
@@ -244,6 +254,29 @@ class RosbridgeClient:
         pass
 
 
+# PROVIDED: the 8 compass directions a snapped stick can land on, as
+# (dir_x, dir_y) unit-ish components (each -1, 0 or +1), starting at E and
+# going counter-clockwise in 45 degree steps - matching
+# atan2(joy_y, joy_x) with joy_y = +1 UP: E, NE, N, NW, W, SW, S, SE.
+_EIGHT_DIRECTIONS = [
+    (1, 0), (1, 1), (0, 1), (-1, 1),
+    (-1, 0), (-1, -1), (0, -1), (1, -1),
+]
+
+
+def snap_to_8_directions(joy_x, joy_y):
+    """PROVIDED - not a TODO. Snap a raw (joy_x, joy_y) stick position to
+    the nearest of the 8 cardinal/intercardinal directions. Returns
+    (dir_x, dir_y), each in {-1, 0, 1}. Within JOY_DEADZONE of the center
+    this returns (0, 0) - see "Constant-speed, 8-direction driving" in the
+    manual for why the joystick works this way this year."""
+    if math.hypot(joy_x, joy_y) < JOY_DEADZONE:
+        return 0, 0
+    angle = math.degrees(math.atan2(joy_y, joy_x)) % 360
+    sector = round(angle / 45) % 8
+    return _EIGHT_DIRECTIONS[sector]
+
+
 def twist_from_joystick(joy_x, joy_y, turn):
     """Convert the window's input state into Twist values.
 
@@ -253,24 +286,38 @@ def twist_from_joystick(joy_x, joy_y, turn):
 
     Returns (lx, ly, az): forward speed in m/s, left speed in m/s, turn rate in rad/s.
     """
-    # TODO 2: compute lx, ly and az from joy_x, joy_y and turn, using
-    #         MAX_LINEAR and MAX_ANGULAR. Three lines. Before writing them,
-    #         work through the sign table under "TODO 2" in the manual:
-    #         one of the three signs is not what you would first expect.
-    lx = 0.0
-    ly = 0.0
+    # PROVIDED: snap the raw stick position to the nearest of the 8 compass
+    # directions, and count how many axes are involved: 0 (centred), 1 (a
+    # cardinal direction: only linear.x OR linear.y is nonzero) or 2 (a
+    # diagonal: both are).
+    dir_x, dir_y = snap_to_8_directions(joy_x, joy_y)
+    axes_active = abs(dir_x) + abs(dir_y)
+
+    if axes_active == 2:
+        # PROVIDED: a diagonal drives BOTH linear.x and linear.y at once. A
+        # mecanum drivetrain mixes them per wheel (roughly FL = vx-vy,
+        # FR = vx+vy, RL = vx+vy, RR = vx-vy), so sending MAX_LINEAR on both
+        # would leave two wheels idle and spin the other two at DOUBLE
+        # speed. This uneven split instead puts one wheel pair at
+        # MAX_LINEAR and the other at MIN_LINEAR (the slowest speed the
+        # motors actually turn at) - see "Constant-speed, 8-direction
+        # driving" in the manual for the derivation.
+        lx = dir_y * (MAX_LINEAR + MIN_LINEAR) / 2
+        ly = -dir_x * (MAX_LINEAR - MIN_LINEAR) / 2
+    elif axes_active == 1:
+        # TODO 2: a cardinal direction drives only ONE of linear.x /
+        #         linear.y. Fill in lx and ly from dir_x, dir_y and
+        #         MAX_LINEAR. Two lines. Before writing them, work through
+        #         the sign table under "TODO 2" in the manual: one of the
+        #         two signs is not what you would first expect.
+        lx = 0.0
+        ly = 0.0
+    else:
+        lx = ly = 0.0                   # centred: PROVIDED
+
+    # TODO 2 (continued): az from turn and MAX_ANGULAR. One line.
     az = 0.0
     return lx, ly, az
-
-
-def motor_floor(v):
-    """The robot's motors have a dead-zone: commanded below about 0.15 m/s
-    they do not turn at all (measured: 0.10 m/s moved one wheel, 0.15 moved
-    all four). So a small joystick deflection is raised to MIN_LINEAR rather
-    than sent as a speed the motors will ignore."""
-    if 0.0 < abs(v) < MIN_LINEAR:
-        return MIN_LINEAR if v > 0 else -MIN_LINEAR
-    return v
 
 
 class TeleopGUI:
@@ -426,7 +473,10 @@ class TeleopGUI:
         dy = max(-1.0, min(1.0, (event.y - c) / usable))
         self.joy_x = dx
         self.joy_y = -dy            # screen y grows DOWNWARD; up must be +
-        self.draw_knob(dx * usable, dy * usable)
+        # PROVIDED: draw the knob snapped to the same 8 directions the robot
+        # actually drives in, instead of following the raw mouse position.
+        dir_x, dir_y = snap_to_8_directions(self.joy_x, self.joy_y)
+        self.draw_knob(dir_x * usable, -dir_y * usable)
 
     def on_release(self, event):
         """Mouse released: knob snaps to centre and the robot stops."""
@@ -452,7 +502,6 @@ class TeleopGUI:
         continuously told what to do, so if this program dies the commands
         simply stop arriving instead of the last one running forever."""
         lx, ly, az = twist_from_joystick(self.joy_x, self.joy_y, self.turn)
-        lx, ly = motor_floor(lx), motor_floor(ly)
         self.client.cmd_vel(lx, ly, az)
 
         self.status.config(
@@ -550,22 +599,35 @@ def _check_todo1():
 
 
 def _check_todo2():
-    L, A = MAX_LINEAR, MAX_ANGULAR
-    cases = [
+    # "not started" is judged only from the cases YOUR lines control
+    # (cardinal, rotate, centred, and the deadzone) - the diagonal cases are
+    # provided code and should already be correct even before you touch
+    # TODO 2, so they are not part of that judgement, only of the FAIL list
+    # once you have started.
+    L, M, A = MAX_LINEAR, MIN_LINEAR, MAX_ANGULAR
+    vx_diag, vy_diag = (L + M) / 2, (L - M) / 2
+    todo_cases = [
         ((0, 1, 0),   (L, 0.0, 0.0),   "knob UP -> drive forward"),
         ((0, -1, 0),  (-L, 0.0, 0.0),  "knob DOWN -> drive backward"),
         ((-1, 0, 0),  (0.0, L, 0.0),   "knob LEFT -> strafe left"),
         ((1, 0, 0),   (0.0, -L, 0.0),  "knob RIGHT -> strafe right  (which way is +y in ROS?)"),
         ((0, 0, 1),   (0.0, 0.0, A),   "Rotate L held -> turn left (counter-clockwise)"),
         ((0, 0, -1),  (0.0, 0.0, -A),  "Rotate R held -> turn right (clockwise)"),
-        ((0, 0.5, 0), (L / 2, 0.0, 0.0), "knob HALF way up -> half speed"),
+        ((0, 0.5, 0), (L, 0.0, 0.0),   "knob HALF way up -> still FULL speed (constant speed, not proportional)"),
         ((0, 0, 0),   (0.0, 0.0, 0.0), "knob centred, nothing held -> all zero"),
     ]
-    results = [twist_from_joystick(jx, jy, t) for (jx, jy, t), _, _ in cases]
+    provided_cases = [
+        ((0.7, 0.7, 0),   (vx_diag, -vy_diag, 0.0),  "knob up-right -> snaps to NE (diagonal split is provided code)"),
+        ((-0.7, 0.7, 0),  (vx_diag, vy_diag, 0.0),   "knob up-left -> snaps to NW (diagonal split is provided code)"),
+        ((0.7, -0.7, 0),  (-vx_diag, -vy_diag, 0.0), "knob down-right -> snaps to SE (diagonal split is provided code)"),
+        ((-0.7, -0.7, 0), (-vx_diag, vy_diag, 0.0),  "knob down-left -> snaps to SW (diagonal split is provided code)"),
+    ]
+    results = [twist_from_joystick(jx, jy, t) for (jx, jy, t), _, _ in todo_cases]
     if all(r == (0.0, 0.0, 0.0) for r in results):
         return [], True                                   # not started
     problems = []
-    for ((jx, jy, t), want, desc), got in zip(cases, results):
+    for (jx, jy, t), want, desc in todo_cases + provided_cases:
+        got = twist_from_joystick(jx, jy, t)
         if not all(abs(g - w) < 1e-9 for g, w in zip(got, want)):
             problems.append(f"{desc}\n            joy_x={jx} joy_y={jy} turn={t}: "
                             f"expected (lx, ly, az) = {want}, got {tuple(round(g, 3) for g in got)}")

@@ -735,7 +735,7 @@ Two things rosbridge does **not** do — we tested both on the robot: a message 
 
 - The robot goes **on the floor** in open space, never on a desk.
 - Leave the speed limits alone until everything works: `MAX_LINEAR = 0.25` m/s and `MAX_ANGULAR = 1.5` rad/s.
-- Know the motors' **dead-zone**: below about 0.15 m/s they do not turn at all (measured: 0.10 m/s moved one wheel, 0.15 moved all four). The scaffold raises any smaller non-zero command to `MIN_LINEAR = 0.15`, so *any* joystick deflection moves the robot at least that fast. There is no such thing as "creeping" — be ready to release.
+- Know the motors' **dead-zone**: below about 0.15 m/s they do not turn at all (measured: 0.10 m/s moved one wheel, 0.15 moved all four). This is why the joystick is **digital** this year rather than proportional — see "Constant-speed, 8-direction driving" below: past a small deadzone at the centre, the stick always commands a fixed, dead-zone-safe speed (`MAX_LINEAR = 0.25` or `MIN_LINEAR = 0.15`), never an arbitrarily small one. There is no such thing as "creeping" — be ready to release.
 - The program must publish a zero Twist when it exits, no matter how it exits (that is TODO 3).
 - A teleop program publishes its current command at a steady rate (the scaffold does this at 10 Hz) rather than only when input changes.
 - Keep one hand near **STOP** / the space bar. If in doubt, close the window; if in real doubt, switch the robot off.
@@ -749,10 +749,10 @@ The one file carries you through Parts H, I and J: you keep building on it rathe
 | Part of the file | What it does | Yours? |
 |------------------|--------------|--------|
 | Settings block | Robot IP and port; topic names, message types and limits for driving (Part H), the camera servos (Part I) and the sonar (Part J) | provided |
-| `motor_floor()` | Raises tiny commands to `MIN_LINEAR` — the motors ignore anything smaller | provided |
+| `snap_to_8_directions()` | Snaps the raw stick position to the nearest of 8 compass directions (deadzone at the centre) | provided |
 | `RosbridgeClient` — connection plumbing | Connects to port 9090, advertises the two topics we publish, starts a thread that listens for messages coming *back* from the robot, sends JSON; reconnects if the link drops | provided |
 | `RosbridgeClient.cmd_vel()` | Publishes one Twist | **TODO 1** (this part) |
-| `twist_from_joystick()` | Turns joystick position + rotate button into `(lx, ly, az)` | **TODO 2** (this part) |
+| `twist_from_joystick()` | Turns the snapped direction + rotate button into `(lx, ly, az)`; the diagonal case is provided, the cardinal case is yours | **TODO 2** (this part) |
 | `RosbridgeClient.set_servos()`, `move_camera()` | Aim the camera | TODO 4, 5 — **Part I, leave for now** |
 | `RosbridgeClient.subscribe()`, `sonar_callback()` | Receive sonar readings | TODO 6, 7 — **Part J, leave for now** |
 | `TeleopGUI` | The window: joystick, Rotate L/R (hold), STOP, space bar, camera pad and arrow keys, sonar readout, status bar, the 10 Hz publish and servo loops | provided — except **TODO 3** in `quit()` |
@@ -789,27 +789,43 @@ python teleop_scaffold.py --check
 
 The line for TODO 1 should end in `ok`. If it says `not done yet`, your code did not change what `cmd_vel()` sends; if it lists `FAIL`s, each one names the field that is missing, misspelled, or wrong. Fix and run `--check` again. (The Part I and Part J lines will say `not done yet` — that is expected until you get there.)
 
-### Step 3 — TODO 2: map the joystick to a Twist
+### Background: constant-speed, 8-direction driving
 
-`twist_from_joystick(joy_x, joy_y, turn)` receives the window's input state:
+This year's joystick is **digital**, not proportional. A real analogue joystick lets you choose both a direction and how fast — push it a little and the robot creeps; push it all the way and it goes flat out. That is not what this scaffold does:
+
+1. **The stick snaps to a direction.** `snap_to_8_directions(joy_x, joy_y)` (provided, above `twist_from_joystick()`) turns the raw `-1..1` position into one of 8 compass directions — N, NE, E, SE, S, SW, W, NW — or `(0, 0)` if the stick is within `JOY_DEADZONE` of the centre. There is nothing in between: a small nudge either does nothing, or drives at full speed in the nearest direction.
+2. **Every direction drives at a fixed speed, not a scaled one.** How far past the deadzone you push the stick makes no difference — only which of the 8 sectors it lands in.
+
+**Why a fixed speed instead of "just move slowly below the dead-zone"?** The motors have a genuine dead-zone: below about 0.15 m/s (`MIN_LINEAR`) they physically do not turn. A proportional joystick can ask for any tiny value in that dead range, and the robot is told to move and does not — a common way a first version of a teleop program looks broken while the status bar shows non-zero numbers. Snapping removes the dead range from the input entirely: the stick is either centred (a real, deliberate zero) or driving at a speed already known to work.
+
+**Why a diagonal is not simply "both axes at `MAX_LINEAR`".** A cardinal direction (N/E/S/W) only ever sends ONE of `linear.x` / `linear.y` — that is your TODO 2, below. A diagonal (NE/SE/SW/NW) sends BOTH at once. The motor controller mixes them per wheel (roughly `FL = vx-vy`, `FR = vx+vy`, `RL = vx+vy`, `RR = vx-vy`), so:
+
+- Sending `MAX_LINEAR` on **both** `vx` and `vy` cancels two wheels to exactly zero and drives the other two at **double** `MAX_LINEAR` — not a constant speed at all.
+- Sending `MAX_LINEAR / 2` on both keeps the wheels that *do* spin below their dead-zone floor: `0.25 / 2 = 0.125`, which is less than `MIN_LINEAR = 0.15` — on the real robot those wheels do not turn either.
+
+The scaffold's diagonal branch (provided, in `twist_from_joystick()`) works around both problems by solving for the two wheel-pair speeds directly — one pair at `MAX_LINEAR`, the other at `MIN_LINEAR` — instead of an even split, so **all four wheels turn on a diagonal**, each at a speed already proven to work. One consequence, worth knowing rather than fixing: because the split is uneven, the robot's true heading on a diagonal is not a clean 45° — it leans toward the forward/backward axis. You are not asked to derive this; read the provided code once TODO 2 is done, if you are curious.
+
+### Step 3 — TODO 2: map a cardinal direction to a Twist
+
+`twist_from_joystick(joy_x, joy_y, turn)` has already (provided) snapped the stick to `dir_x, dir_y` — each `-1`, `0` or `+1` — and worked out `axes_active`, how many of them are nonzero. The diagonal case (`axes_active == 2`) is provided code; **your TODO 2 is the cardinal case** (`axes_active == 1`), where exactly one of `dir_x` / `dir_y` is nonzero, plus the turn rate below it:
 
 | Input | Range | Meaning |
 |-------|-------|---------|
-| `joy_y` | −1 … +1 | knob position up/down. `+1` = pushed fully **up**. (The scaffold has already flipped the screen's downward y axis for you.) |
-| `joy_x` | −1 … +1 | knob position left/right. `+1` = pushed fully **right**. |
+| `dir_y` | −1, 0, +1 | `+1` = the stick snapped to a direction with a **forward** component. (The scaffold has already flipped the screen's downward y axis for you.) |
+| `dir_x` | −1, 0, +1 | `+1` = the stick snapped to a direction with a **rightward** component. |
 | `turn` | −1, 0, +1 | `+1` while **Rotate L** is held, `−1` while **Rotate R** is held, `0` otherwise |
 
-and must return `(lx, ly, az)`. Each output is just the matching input scaled by its speed limit (`MAX_LINEAR` or `MAX_ANGULAR`). The only thing to decide is the **sign**, and the way to decide it is: *what should the robot do, and which Twist sign means that?* Fill in the last column using the Twist table above:
+and must set `lx`, `ly` (inside the `axes_active == 1` branch) and `az` (below the `if`/`elif`, it applies to every case). Each output is just the matching input scaled by its speed limit (`MAX_LINEAR` or `MAX_ANGULAR`) — no proportional scaling needed, since on a cardinal move `dir_x`/`dir_y` are already exactly `-1`, `0` or `1`. The only thing to decide is the **sign**, and the way to decide it is: *what should the robot do, and which Twist sign means that?* Fill in the last column using the Twist table above:
 
 | Input | The robot should… | Twist field | Which sign of the field means that? | So the formula is… |
 |-------|-------------------|-------------|-------------------------------------|--------------------|
-| `joy_y = +1` (knob up) | drive forward | `linear.x` | `+` | `lx = joy_y * MAX_LINEAR` |
-| `joy_x = +1` (knob right) | strafe **right** | `linear.y` | ? | `ly = ___ * MAX_LINEAR` |
+| `dir_y = +1` (a forward direction) | drive forward | `linear.x` | `+` | `lx = dir_y * MAX_LINEAR` |
+| `dir_x = +1` (a rightward direction) | strafe **right** | `linear.y` | ? | `ly = ___ * MAX_LINEAR` |
 | `turn = +1` (Rotate L) | turn left, counter-clockwise | `angular.z` | ? | `az = ___ * MAX_ANGULAR` |
 
 Two of the three formulas look exactly like the first row. One does not — for that row, the input is positive but the Twist field must be negative. If you are not sure which, re-read the `+` column of the Twist table.
 
-Run `--check` again. TODO 2 should now be `ok` and the summary should say `Part H: complete.` If exactly the two *strafe* cases fail and everything else passes, you have found the famous one.
+Run `--check` again. TODO 2 should now be `ok` and the summary should say `Part H: complete.` (this also re-checks the provided diagonal cases — if one of those fails, you have edited provided code by mistake; revert it rather than adjusting your TODO 2 lines to satisfy it). If exactly the two *strafe* cases fail and everything else passes, you have found the famous one.
 
 ### Step 4 — TODO 3: stop on exit
 
@@ -831,11 +847,11 @@ python teleop_scaffold.py
 
 Within a few seconds the top line should read **`rosbridge: connected to 192.168.149.1`** in green. The status bar at the bottom shows the exact values being published right now; while the knob is centred it reads `linear.x=+0.00  linear.y=+0.00  angular.z=+0.00`.
 
-Drag the knob **upward** a little. The robot drives forward at 0.15 m/s (the smallest speed its motors respond to); push further and it goes up to 0.25. Release: it stops. Now work through all of these:
+Drag the knob **upward** a little, past the small deadzone at the centre. Unlike a normal joystick, nudging it further does not speed the robot up — it is already driving forward at the full `MAX_LINEAR` (0.25 m/s), because the stick is digital (see "Constant-speed, 8-direction driving" above). Release: it stops. Now work through all of these:
 
-- [ ] Knob up → forward; knob down → backward
+- [ ] Knob up → forward; knob down → backward, both at a constant speed regardless of how far up/down the knob is
 - [ ] Knob left → strafes left; knob right → strafes right (the robot does not turn)
-- [ ] Knob **diagonally** up-and-right → the robot moves diagonally, still facing the same way. That is holonomic motion; a car cannot do it.
+- [ ] Knob **diagonally** up-and-right → the robot moves roughly up-and-right, still facing the same way, with all **4** wheels turning (watch the wheels, not just the status bar — two of them turn slower than the other two, at `MIN_LINEAR` instead of `MAX_LINEAR`; that is expected, see the Background section above). That is holonomic motion; a car cannot do it.
 - [ ] Hold **Rotate L** → turns left on the spot; release → stops. Same for **Rotate R**.
 - [ ] Releasing the knob stops the robot within about half a second
 - [ ] **STOP** and the space bar stop everything
@@ -1047,7 +1063,7 @@ Before moving on, all of these should be true:
 - [ ] `http://192.168.149.1:8080/` in a browser shows live video from `image_raw`
 - [ ] `python camera_check.py` shows both status lines green and live video — and it is *your* bench in the picture
 - [ ] Your robot broadcasts the network name you gave it in Part G, and SSH still works at `192.168.149.1`
-- [ ] `python teleop_scaffold.py --check` prints `ALL CHECKS PASSED`
+- [ ] `python teleop_scaffold.py --check` reports `Part H: complete.` (also `Part I:` and `Part J:` as you reach them)
 - [ ] The robot drives forward, backward, strafes both ways, rotates both ways, stops on release, and stops when the window is closed mid-drive (Alt+F4)
 - [ ] `--check` reports `Part I: complete.` — holding the camera pad or arrow keys pans and tilts the camera, `pan=`/`tilt=` in the status bar stop at 1000 and 2000, and `⌂` re-centres
 - [ ] `--check` reports `Part J: complete.` — the sonar readout shows a live distance that falls as your hand approaches
@@ -1098,7 +1114,11 @@ ssh pi@192.168.149.1
 
 **Teleop: `rosbridge: NOT connected - ... refused` or `... timed out`.** The computer cannot reach port 9090. Same checklist as the camera: are you on the robot's Wi-Fi? Does `ROBOT_IP` match? Does `camera_check.py` still connect? If the camera works but rosbridge does not, tell your demonstrator.
 
-**Teleop: connected, `--check` passes, status bar shows non-zero values, but the robot does not move (or only one wheel turns).** If the value shown is below 0.15, you have changed `MIN_LINEAR` or `motor_floor()` — put them back; the motors do not turn below that. Otherwise check the battery — a low battery makes the motors weak or disables them. Confirm the messages are actually arriving with the `ros2 topic echo /cmd_vel` command in Part H, Step 5. If they arrive and the robot still does not move, tell your demonstrator.
+**Teleop: connected, `--check` passes, status bar shows non-zero values, but the robot does not move at all.** If the value shown is below 0.15, you have changed `MIN_LINEAR` or `snap_to_8_directions()` — put them back; the motors do not turn below that, and the scaffold's whole point is to never send a value in that dead range. Otherwise check the battery — a low battery makes the motors weak or disables them. Confirm the messages are actually arriving with the `ros2 topic echo /cmd_vel` command in Part H, Step 5. If they arrive and the robot still does not move, tell your demonstrator.
+
+**Teleop: on a cardinal direction (N/E/S/W), only some wheels turn.** All four should turn together on a cardinal move. If they do not, either the status bar shows a value below 0.15 (see above), or your TODO 2 has the wrong field — compare `lx`/`ly` in the status bar against the Twist table.
+
+**Teleop: on a diagonal (NE/SE/SW/NW), only two wheels turn, or all four turn at the same speed.** Two wheels turning slower than the other two on a diagonal is **correct** — read "Constant-speed, 8-direction driving" above. Only two turning *at all* (the other two doing nothing), or all four at an identical speed, means the diagonal branch of `twist_from_joystick()` has been edited from the provided code; put it back and re-run `--check` (it checks the diagonal cases too).
 
 **Teleop: the robot drives and turns fine but does not strafe.** Strafing only works if the four mecanum wheels are mounted in the right positions (their rollers must form an X seen from above). Your commands are correct — the status bar shows `linear.y` — the chassis is not. Tell your demonstrator.
 
@@ -1183,7 +1203,7 @@ If you finish early:
 - **A second sensor:** the `subscribe()` you wrote works for any topic. Run `ros2 topic list` in a container shell and look for the battery voltage or IMU topics, check their types with `ros2 topic info`, then add a second `subscribe()` call in `connect()`, a callback that stores the value, and a label that shows it.
 - **Keyboard driving:** bind `<KeyPress-w>` / `<KeyRelease-w>` (and `s`, `a`, `d`, `q`, `e`) on `root` to set and clear `joy_x`, `joy_y`, `turn`, exactly as the Rotate buttons do with press/release.
 - **Orbit (needs keyboard driving):** with one mouse you cannot strafe and rotate at the same time. Once `q`/`e` rotate from the keyboard, hold `e` while dragging the knob to the left: the robot strafes one way while turning the other, and circles a point on the floor while facing it. Only a holonomic robot can do this. Adjust the two speeds until the circle closes.
-- **Speed slider:** a `tk.Scale` from 0.05 to 0.30 whose value replaces `MAX_LINEAR` in `twist_from_joystick()`.
+- **Speed slider:** a `tk.Scale` from 0.05 to 0.30 whose value replaces `MAX_LINEAR` in `twist_from_joystick()`. Keep it above `MIN_LINEAR` (0.15) or the diagonal case's wheel-pair split stops making sense.
 - **Drive by camera:** put the camera feed from `camera_check.py` next to the joystick. The `MjpegCamera` class can be imported directly if both files are in the same folder: `from camera_check import MjpegCamera`.
 - **Deadman switch:** the robot only moves while a chosen key is physically held.
 - **Command log:** write every published `(lx, ly, az)` with a timestamp to a file, and print a summary on exit.
